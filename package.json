@@ -1,0 +1,10 @@
+{
+  "name": "flaneur-backend",
+  "version": "1.0.0",
+  "description": "Flâneur — neighborhood music identity generator (Claude proxy)",
+  "type": "module",
+  "private": true,
+  "engines": {
+    "node": ">=18"
+  }
+}
