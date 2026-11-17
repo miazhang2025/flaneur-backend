@@ -1,0 +1,17 @@
+{
+  "outputDirectory": "public",
+  "headers": [
+    {
+      "source": "/v1/index.json",
+      "headers": [{ "key": "Cache-Control", "value": "public, max-age=300, s-maxage=300, stale-while-revalidate=86400" }]
+    },
+    {
+      "source": "/v1/flags.json",
+      "headers": [{ "key": "Cache-Control", "value": "public, max-age=300, s-maxage=300, stale-while-revalidate=3600" }]
+    },
+    {
+      "source": "/v1/pool/(.*)",
+      "headers": [{ "key": "Cache-Control", "value": "public, max-age=3600, s-maxage=86400, stale-while-revalidate=604800" }]
+    }
+  ]
+}
