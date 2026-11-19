@@ -59,8 +59,18 @@ def token():
         "https://accounts.spotify.com/api/token", data=b"grant_type=client_credentials",
         headers={"Authorization": "Basic " + base64.b64encode(f"{cid}:{secret}".encode()).decode(),
                  "Content-Type": "application/x-www-form-urlencoded"})
-    with urllib.request.urlopen(req, timeout=30) as r:
-        d = json.loads(r.read())
+    for attempt in range(6):
+        try:
+            with urllib.request.urlopen(req, timeout=30) as r:
+                d = json.loads(r.read())
+            break
+        except (urllib.error.URLError, TimeoutError, ConnectionError) as e:
+            if isinstance(e, urllib.error.HTTPError):
+                raise
+            print(f"  token: network error ({e}); retry {attempt + 1}/6", flush=True)
+            time.sleep(min(60, 5 * 2 ** attempt))
+    else:
+        raise Stop("can't reach accounts.spotify.com — check the network/VPN, then re-run")
     _token, _token_exp = d["access_token"], time.time() + d["expires_in"]
     return _token
 
@@ -128,7 +138,7 @@ def get(path, **params):
             time.sleep(min(60, 5 * 2 ** attempt))
             continue
     else:
-        raise RuntimeError(f"Spotify kept failing: {url}")
+        raise Stop("Spotify unreachable after retries — check the network/VPN, then re-run")
     f.parent.mkdir(parents=True, exist_ok=True)
     f.write_text(json.dumps(d))
     return d
