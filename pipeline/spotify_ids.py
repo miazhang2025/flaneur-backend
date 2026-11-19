@@ -65,19 +65,45 @@ def token():
     return _token
 
 
+class Stop(Exception):
+    """End this run early (rate limit / request budget); results so far are written."""
+
+
+MAX_REQUESTS = int(os.environ.get("SPOTIFY_MAX_REQUESTS", "400"))   # per run
+_requests = 0
+
+
+def url_for(path, **params):
+    return f"https://api.spotify.com/v1/{path}?" + urllib.parse.urlencode(params)
+
+
+def cache_file(path, url):
+    return CACHE / path.split("/")[0] / (hashlib.sha1(url.encode()).hexdigest() + ".json")
+
+
+def cached(path, **params):
+    """A response already on disk, or None — never touches the network."""
+    f = cache_file(path, url_for(path, **params))
+    return json.loads(f.read_text()) if f.exists() else None
+
+
 def get(path, **params):
-    """Cached GET against api.spotify.com/v1 (1 req/s; short 429s waited out, long ones stop the run).
+    """Cached GET against api.spotify.com/v1 (1 req/s; short 429s waited out).
+    Raises Stop on a long Retry-After or when this run's request budget is spent.
     Returns parsed JSON, or {"_status": code} for 4xx so callers can fall back."""
-    global _last
-    url = f"https://api.spotify.com/v1/{path}?" + urllib.parse.urlencode(params)
-    f = CACHE / path.split("/")[0] / (hashlib.sha1(url.encode()).hexdigest() + ".json")
+    global _last, _requests
+    url = url_for(path, **params)
+    f = cache_file(path, url)
     if f.exists():
         return json.loads(f.read_text())
+    if _requests >= MAX_REQUESTS:
+        raise Stop(f"request budget ({MAX_REQUESTS}) spent — re-run later to continue")
     for attempt in range(6):
         wait = PACE - (time.monotonic() - _last)
         if wait > 0:
             time.sleep(wait)
         _last = time.monotonic()
+        _requests += 1
         req = urllib.request.Request(url, headers={"Authorization": f"Bearer {token()}"})
         try:
             with urllib.request.urlopen(req, timeout=30) as r:
@@ -87,9 +113,8 @@ def get(path, **params):
             if e.code == 429:
                 ra = int(e.headers.get("Retry-After", "5"))
                 if ra > MAX_WAIT:
-                    resume = time.strftime("%H:%M", time.localtime(time.time() + ra))
-                    sys.exit(f"Spotify rate limit: Retry-After {ra}s → re-run after ~{resume}. "
-                             "Everything fetched so far is cached.")
+                    resume = time.strftime("%m-%d %H:%M", time.localtime(time.time() + ra))
+                    raise Stop(f"Spotify rate limit: Retry-After {ra}s → re-run after ~{resume}")
                 print(f"  429, waiting {ra}s", flush=True)
                 time.sleep(ra + 1)
                 continue
@@ -126,14 +151,32 @@ def has_cjk(s):
     return any("぀" <= c <= "鿿" or "가" <= c <= "힯" for c in s)
 
 
+ARTIST_MIN = 0.80   # a different performer of the same title is the wrong recording
+
+
 def score(want_artist, want_title, item):
     t = sim(want_title, item["name"])
     names = [a["name"] for a in item.get("artists") or []]
     a = max((sim(want_artist, n) for n in names), default=0.0)
     # Same song credited in another script (鄧麗君 vs Teresa Teng): trust an exact title.
     if a < 0.5 and t == 1.0 and any(has_cjk(n) != has_cjk(want_artist) for n in names):
-        a = 0.75
+        a = ARTIST_MIN
+    if a < ARTIST_MIN:          # Dean Martin ≠ Dean Brody, The Temptations ≠ The Foundations
+        return min(0.55 * t + 0.45 * a, ACCEPT - 0.01)
+    if not numbers_agree(want_title, item["name"]):   # Op. 31 ≠ Op. 47
+        return min(0.55 * t + 0.45 * a, ACCEPT - 0.01)
     return 0.55 * t + 0.45 * a
+
+
+def numbers_agree(a, b):
+    """When both titles carry numbers (opus, No., K.), the shorter set must be inside the
+    longer one — "Cello Suite No. 1" fits "…No. 1 in G Major, BWV 1007", Op. 31 ≠ Op. 47."""
+    import re
+    na, nb = set(re.findall(r"\d+", a)), set(re.findall(r"\d+", b))
+    if not na or not nb:
+        return True
+    small, big = sorted((na, nb), key=len)
+    return small <= big
 
 
 def summary(item, how, s):
@@ -147,39 +190,51 @@ def playable(item):
     return item and item.get("is_playable", True) is not False
 
 
-def verify(ids):
-    """id → track item for IDs that still resolve (batch, falling back to one-by-one)."""
-    out = {}
-    for i in range(0, len(ids), 50):
-        chunk = ids[i:i + 50]
-        print(f"  verifying {i}/{len(ids)}", flush=True)
-        d = get("tracks", ids=",".join(chunk), market=MARKET)
-        if "_status" in d:                    # batch endpoint unavailable → single GETs
-            for tid in chunk:
-                one = get(f"tracks/{tid}", market=MARKET)
-                if "_status" not in one:
-                    out[tid] = one
-            continue
-        for item in d.get("tracks") or []:
-            if item:
-                out[item["id"]] = item
-    return out
+def muse_item(tid):
+    """A MuSe Spotify ID's track, from cache only (verification is no longer requested —
+    the dev-mode quota is spent on searches instead; unverified IDs are trusted)."""
+    d = cached(f"tracks/{tid}", market=MARKET)
+    return d if d and "_status" not in d else None
 
 
-def search(artist, title):
+def search(artist, title, isrc=None):
+    """Best playable match. With an ISRC: one exact `isrc:` query. Otherwise a fielded
+    query, and free text only if that returned nothing."""
+    queries = ([f"isrc:{isrc}"] if isrc else []) + [f'track:"{title}" artist:"{artist}"', f"{artist} {title}"]
     best, best_s = None, 0.0
-    queries = [f'track:"{title}" artist:"{artist}"', f"{artist} {title}"]
     for q in queries:
         d = get("search", q=q, type="track", limit=5, market=MARKET)
-        for item in ((d.get("tracks") or {}).get("items") or []):
-            if not playable(item):
-                continue
+        items = [i for i in ((d.get("tracks") or {}).get("items") or []) if playable(i)]
+        for item in items:
             s = score(artist, title, item)
+            if q.startswith("isrc:"):
+                s = max(s, 0.95)          # same recording by definition
             if s > best_s:
                 best, best_s = item, s
-        if best_s >= FUZZY:
+        if best_s >= ACCEPT or items:
             break
     return (best, best_s) if best_s >= ACCEPT else (None, best_s)
+
+
+PER_HOOD_EXTRA = 20   # besides the anchors: the strongest History candidates per hood
+
+
+def priority(pools):
+    """Track keys worth a Spotify search, most important first: every anchor, then each
+    hood's top PER_HOOD_EXTRA History candidates (MusicBrainz / similar) by score."""
+    first, then = [], []
+    for p in pools.values():
+        cs = p["candidates"]
+        first += [key(c["artist"], c["title"]) for c in cs if "anchor" in c["sources"]]
+        rest = sorted((c for c in cs if "anchor" not in c["sources"] and c["history"] > 0),
+                      key=lambda c: -c["history"])[:PER_HOOD_EXTRA]
+        then += [key(c["artist"], c["title"]) for c in rest]
+    seen, out = set(), []
+    for k in first + then:
+        if k not in seen:
+            seen.add(k)
+            out.append(k)
+    return out
 
 
 # ---------- main ----------
@@ -191,57 +246,79 @@ def main():
     for p in pools.values():
         for c in p["candidates"]:
             uniq.setdefault(key(c["artist"], c["title"]), c)
-    print(f"{len(uniq)} unique tracks across {len(pools)} pools", flush=True)
+    print(f"{len(uniq)} unique tracks across {len(pools)} pools · budget {MAX_REQUESTS} requests", flush=True)
 
-    muse_ids = sorted({c["spotifyId"] for c in uniq.values() if c.get("spotifyId")})
-    verified = verify(muse_ids)
-    print(f"MuSe IDs: {len(verified)}/{len(muse_ids)} still resolve", flush=True)
+    # Keep earlier results (a previous run's matches stay; only pending ones are retried).
+    result = {}
+    for k, c in uniq.items():
+        if c.get("spotifyMatch") in ("muse", "search", "none"):
+            result[k] = {f: c.get(f) for f in ("spotifyId", "isrc", "spotifyName", "spotifyArtist",
+                                                "spotifyMatch", "spotifyScore")}
 
-    result, misses = {}, []
-    for n, (k, c) in enumerate(uniq.items(), 1):
-        item = verified.get(c.get("spotifyId") or "")
-        if playable(item) and score(c["artist"], c["title"], item) >= ACCEPT:
+    # MuSe IDs: verified ones from cache (adds ISRC), the rest trusted as-is.
+    for k, c in uniq.items():
+        if k in result or not c.get("spotifyId"):
+            continue
+        item = muse_item(c["spotifyId"])
+        if item and playable(item) and score(c["artist"], c["title"], item) >= ACCEPT:
             result[k] = summary(item, "muse", score(c["artist"], c["title"], item))
-        else:
-            item, s = search(c["artist"], c["title"])
+            if c.get("isrc") and not result[k]["isrc"]:
+                result[k]["isrc"] = c["isrc"]
+        elif not item:
+            result[k] = {"spotifyId": c["spotifyId"], "isrc": c.get("isrc"),
+                         "spotifyMatch": "muse", "spotifyScore": None}
+
+    # Searches, in priority order, until done or stopped.
+    todo = [k for k in priority(pools) if k not in result]
+    stopped = None
+    try:
+        for n, k in enumerate(todo, 1):
+            c = uniq[k]
+            item, s = search(c["artist"], c["title"], c.get("isrc"))
             if item:
                 result[k] = summary(item, "search", s)
+                if c.get("isrc") and not result[k]["isrc"]:
+                    result[k]["isrc"] = c["isrc"]
             else:
-                result[k] = {"spotifyId": None, "isrc": None, "spotifyMatch": "none", "spotifyScore": round(s, 3)}
-                misses.append(c)
-        if n % 250 == 0:
-            print(f"  {n}/{len(uniq)}", flush=True)
+                result[k] = {"spotifyId": None, "isrc": c.get("isrc"), "spotifyMatch": "none",
+                             "spotifyScore": round(s, 3)}
+            if n % 50 == 0:
+                print(f"  searched {n}/{len(todo)} ({_requests} requests)", flush=True)
+    except Stop as e:
+        stopped = str(e)
 
     rows = []
     for f, p in pools.items():
         for c in p["candidates"]:
-            for f_ in ("spotifyName", "spotifyArtist"):
-                c.pop(f_, None)
-            c.update(result[key(c["artist"], c["title"])])
-        ok = sum(1 for c in p["candidates"] if c["spotifyId"])
-        rows.append((p["name"], ok, len(p["candidates"]),
-                     sum(1 for c in p["candidates"] if "anchor" in c["sources"] and not c["spotifyId"])))
+            k = key(c["artist"], c["title"])
+            r = result.get(k)
+            if r:
+                c.update({kk: v for kk, v in r.items() if v is not None or kk == "spotifyId"})
+            else:
+                c["spotifyMatch"] = "pending" if k in todo else "deferred"
+                c.setdefault("spotifyId", None)
+        ok = sum(1 for c in p["candidates"] if c.get("spotifyId"))
+        miss_anchor = sum(1 for c in p["candidates"] if "anchor" in c["sources"] and not c.get("spotifyId"))
+        rows.append((p["name"], ok, len(p["candidates"]), miss_anchor))
         Path(f).write_text(json.dumps(p, ensure_ascii=False, indent=1))
 
-    fuzzy = [(c, result[k]) for k, c in uniq.items()
-             if result[k]["spotifyId"] and result[k]["spotifyScore"] < FUZZY]
-    found = sum(1 for r in result.values() if r["spotifyId"])
+    done = sum(1 for k in todo if k in result)
+    found = sum(1 for r in result.values() if r.get("spotifyId"))
     L = ["# Spotify matching (4d) — Manhattan", "",
-         f"{found}/{len(uniq)} unique tracks matched "
-         f"({sum(1 for r in result.values() if r['spotifyMatch'] == 'muse')} via MuSe ID, "
-         f"{sum(1 for r in result.values() if r['spotifyMatch'] == 'search')} via search). "
-         "Unmatched tracks are left out of the served pool.", "",
-         "| hood | playable | pool | anchors missing |", "|---|---|---|---|"]
+         f"{found}/{len(uniq)} unique tracks have a Spotify ID. Priority searches: {done}/{len(todo)} done"
+         + (f" — stopped: {stopped}" if stopped else "") + ".",
+         "Tracks beyond each hood's anchors + top History candidates are deferred (no search yet); "
+         "they still play for Apple Music listeners via ISRC.", "",
+         "| hood | Spotify-playable | pool | anchors missing |", "|---|---|---|---|"]
     L += [f"| {n} | {ok} | {tot} | {am or ''} |" for n, ok, tot, am in rows]
-    L += ["", f"## Fuzzy matches to check ({len(fuzzy)})", "",
-          "wanted → got (score)", ""]
-    L += [f"- {c['artist']} — {c['title']} → {r['spotifyArtist']} — {r['spotifyName']} ({r['spotifyScore']})"
+    fuzzy = [(uniq[k], r) for k, r in result.items()
+             if r.get("spotifyId") and r.get("spotifyScore") and r["spotifyScore"] < FUZZY]
+    L += ["", f"## Fuzzy matches to check ({len(fuzzy)})", "", "wanted → got (score)", ""]
+    L += [f"- {c['artist']} — {c['title']} → {r.get('spotifyArtist')} — {r.get('spotifyName')} ({r['spotifyScore']})"
           for c, r in sorted(fuzzy, key=lambda x: x[1]["spotifyScore"])]
-    anchors_missing = [c for c in misses if "anchor" in c["sources"]]
-    L += ["", f"## Anchors with no match ({len(anchors_missing)})", ""]
-    L += [f"- {c['artist']} — {c['title']}" for c in anchors_missing]
     REVIEW.write_text("\n".join(L) + "\n")
-    print(f"{found}/{len(uniq)} matched · review → {REVIEW}")
+    print(f"{found}/{len(uniq)} with Spotify ID · priority {done}/{len(todo)} · {_requests} requests"
+          + (f" · STOPPED: {stopped}" if stopped else "") + f" · review → {REVIEW}")
 
 
 if __name__ == "__main__":
